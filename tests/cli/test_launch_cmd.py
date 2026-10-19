@@ -931,3 +931,49 @@ def test_no_server_blames_loading_first_because_serve_returns_early(runner, fake
     flat = result.output.replace("\n", " ")
     assert "still loading" in flat
     assert "docker logs" in flat
+
+
+@pytest.fixture
+def fake_gradio(monkeypatch, tmp_path):
+    """A Python reporting Gradio `version`, reached through TT_TOOL_BIN_GRADIO."""
+
+    def make(version: str = "6.0.2"):
+        python = tmp_path / "python3"
+        python.write_text(f"#!/bin/sh\necho {version}\n")
+        python.chmod(0o755)
+        monkeypatch.setenv("TT_TOOL_BIN_GRADIO", str(python))
+        return python
+
+    return make
+
+
+@pytest.mark.fakes_only
+def test_gradio_hands_a_speech_model_to_the_bundled_app(runner, served, fake_gradio, execed):
+    from tenstorrent.launchers.apps.gradio import APP
+
+    python = fake_gradio()
+    result = runner.invoke(app, ["launch", "gradio", "--url", served("openai/whisper-large-v3")])
+    assert result.exit_code == 0, result.output
+    assert execed == [[str(python), str(APP)]]
+
+
+@pytest.mark.fakes_only
+def test_gradio_json_reports_the_modality_without_starting(runner, served, fake_gradio, execed):
+    fake_gradio()
+    result = runner.invoke(
+        app, ["launch", "gradio", "--url", served("openai/whisper-large-v3"), "--json"]
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["modality"] == "audio"
+    assert payload["env"]["TT_GRADIO_MODALITY"] == "audio"
+    assert execed == []
+
+
+@pytest.mark.fakes_only
+def test_gradio_refuses_an_old_gradio(runner, served, fake_gradio, execed):
+    fake_gradio("5.49.1")
+    result = runner.invoke(app, ["launch", "gradio", "--url", served("Qwen/Qwen3-32B")])
+    assert result.exit_code == ExitCode.TOOL_MISSING
+    assert "5.49.1" in result.output
+    assert execed == []

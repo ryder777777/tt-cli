@@ -181,7 +181,8 @@ A missing client exits 4 with the install hint below.
 
 Every client needs an OpenAI-compatible server already answering `/v1/models`,
 by default at `http://127.0.0.1:20000/v1` (`tt serve` puts one there). The terminal
-clients additionally need a model that supports tool calling.
+clients additionally need a model that supports tool calling; `gradio` works with any
+model type except training.
 
 | Client | Needs | Install |
 |---|---|---|
@@ -192,6 +193,7 @@ clients additionally need a model that supports tool calling.
 | `aider` | `aider` on PATH | https://aider.chat/docs/install.html |
 | `qwencode` | `qwen` on PATH; Node.js 22+ | `npm install -g @qwen-code/qwen-code` |
 | `hermes` | `hermes` on PATH | `curl -fsSL https://hermes-agent.nousresearch.com/install.sh \| bash` |
+| `gradio` | Gradio 6+, with `gradio` on PATH (tt runs the app with the Python that script names); host port 7860 free, or the next one | `uv tool install gradio`, `pipx install gradio`, or `pip install gradio` |
 
 ## Interactive prompts and automation
 

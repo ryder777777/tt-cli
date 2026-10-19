@@ -10,7 +10,7 @@ tt launch list              # 2. see which clients are available here
 tt launch openwebui         # 3. connect one
 ```
 
-There are two kinds of client, and the difference is **who installs it**.
+There are three kinds of client, and the difference is **who installs it**.
 
 ## Web UIs: tt pulls and runs them for you
 
@@ -36,6 +36,29 @@ tt never installs these. Install the agent yourself, then `tt launch` writes the
 - Coding agents need a model that can do **tool calling**. If tt knows the model you're serving can't, it stops and suggests one that can (`--force` connects anyway). For a model outside tt's catalog it can't check, so it warns and carries on.
 - tt shows the change and asks before writing to a client's config file. `tt launch disconnect <client>` removes what tt wrote.
 
+## Gradio: you install Gradio, tt brings the UI
+
+`tt launch gradio` opens a browser UI for **any** model tt serves, not just chat models. tt ships the app; you only install [Gradio](https://www.gradio.app/) 6 or later. The UI follows the model's type:
+
+| Model type | What you get |
+|---|---|
+| LLM / VLM | Streaming chat; image upload for vision models |
+| Embedding | Embed several texts and compare them (cosine similarity) |
+| Speech recognition (Whisper) | Record or upload audio, get text |
+| Text to speech | Type text, play the audio |
+| Image generation | Prompt, steps, seed, gallery |
+| Video generation | Prompt, then live job status and the video |
+| CNN | Upload an image, see the predictions |
+
+```bash
+uv tool install gradio   # or: pipx install gradio, or pip install gradio in a venv
+tt launch gradio         # opens http://127.0.0.1:7860; Ctrl+C stops it
+```
+
+- tt takes the model's type from its catalog. For a model outside the catalog it reads the server's routes (`/openapi.json`), and falls back to chat if it can't tell.
+- Any Gradio install works (global, a venv, conda, pipx, uv): tt finds `gradio` on PATH and runs the app with the Python behind it. For a venv that isn't activated, point tt at it: `TT_TOOL_BIN_GRADIO=/path/to/venv/bin/python`.
+- Nothing is written to disk. The UI listens on 127.0.0.1 only, and Gradio's usage analytics are turned off.
+
 ## What about TT Studio?
 
 [TT Studio](https://github.com/tenstorrent/tt-studio) is **not** a `tt launch` client. It's a serving backend with its own web UI: it deploys the model *and* gives you the interface. Start it with:
@@ -53,6 +76,7 @@ tt launch list                       # every client, and whether it's usable now
 tt launch <client>                   # connect it to the model you're serving
 tt launch <client> --dry-run         # show what would be done, change nothing
 tt launch stop openwebui             # stop a web UI (or the Hermes dashboard); its data is kept
+tt launch gradio                     # a UI for whatever model is served; Ctrl+C stops it
 tt launch disconnect opencode        # undo the config tt wrote for a client
 ```
 
@@ -62,7 +86,7 @@ tt launch disconnect opencode        # undo the config tt wrote for a client
 | `--port N` | Port the model is served on, if tt can't find it |
 | `--url URL` | Full OpenAI-compatible base URL ending in `/v1`, for a server on another machine |
 | `--web` | Open the client's web UI instead of its terminal UI (Hermes Agent) |
-| `--web-port N` | Host port for a web UI (default 3000, or the next free port above it) |
+| `--web-port N` | Host port for a web UI (default 3000, or 7860 for Gradio, or the next free port above it) |
 | `--no-exec` | Set the client up but don't start it |
 | `--yes`, `-y` | Skip the confirmation prompt |
 | `--force` | Connect even if the model can't do tool calling |

@@ -92,3 +92,29 @@ def probe(base_url: str, *, timeout_s: float = _TIMEOUT_S) -> list[RunningModel]
         return discover(base_url, timeout_s=timeout_s)
     except TTError:
         return None
+
+
+# Checked in order: vLLM lists audio and embedding routes beside chat, so chat
+# has to win; the media server registers only its own service's routes.
+_MODALITY_ROUTES = (
+    ("/v1/chat/completions", "llm"),
+    ("/v1/images/generations", "image"),
+    ("/v1/videos/generations", "video"),
+    ("/v1/audio/speech", "text_to_speech"),
+    ("/v1/audio/transcriptions", "audio"),
+    ("/v1/audio/translations", "audio"),
+    ("/v1/embeddings", "embedding"),
+    ("/v1/cnn/search-image", "cnn"),
+)
+
+
+def detect_modality(base_url: str, *, timeout_s: float = _TIMEOUT_S) -> str | None:
+    """The catalog model_type a server's routes imply, read from its FastAPI
+    /openapi.json. None if it publishes no schema or no known route."""
+    root = base_url.removesuffix("/v1")
+    try:
+        with urllib.request.urlopen(f"{root}/openapi.json", timeout=timeout_s) as response:
+            paths = json.load(response).get("paths") or {}
+    except (urllib.error.URLError, OSError, ValueError, AttributeError):
+        return None
+    return next((modality for route, modality in _MODALITY_ROUTES if route in paths), None)

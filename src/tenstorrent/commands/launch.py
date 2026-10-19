@@ -165,6 +165,19 @@ def _check_capability(appctx, launcher: Launcher, model: RunningModel, *, force:
                 f"it supports the tool calling {launcher.id} needs."
             )
         return
+    # A client with a UI per modality (Gradio) gates on the model's type instead.
+    modalities = getattr(launcher, "modalities", None)
+    if modalities is not None:
+        if entry.model_type in modalities:
+            return
+        raise TTError(
+            f"{launcher.id} has no UI for {entry.name}.",
+            why=f"{entry.name} is a {entry.model_type} model; {launcher.id} handles "
+            f"{', '.join(sorted(modalities))}.",
+            next_step="Serve a model of one of those types instead.",
+            exit_code=ExitCode.UNSUPPORTED,
+            details={"model": entry.name, "tool": launcher.id},
+        )
     chat = serves_chat(entry)
     if chat and (tool_call_parser(entry) or not launcher.requires_tool_calling):
         return
@@ -303,11 +316,17 @@ def _connect(
         launcher.handoff(target, prep, env)
 
 
+def _kind(launcher: Launcher) -> str:
+    return getattr(launcher, "kind", None) or (
+        "terminal" if launcher.hands_over_terminal else "web service"
+    )
+
+
 for _name, _launcher_obj in LAUNCHERS.items():
-    launch_app.command(
-        _name,
-        help=f"Connect {_name} ({'terminal client' if _launcher_obj.hands_over_terminal else 'web service'}).",
-    )(handle_tt_errors(_connect))
+    _label = _kind(_launcher_obj).replace("terminal", "terminal client")
+    launch_app.command(_name, help=f"Connect {_name} ({_label}).")(
+        handle_tt_errors(_connect)
+    )
 
 
 # -- list -------------------------------------------------------------------------
@@ -337,8 +356,9 @@ def _catalog(appctx) -> list[dict]:
         rows.append(
             {
                 "tool": launcher.id,
-                "kind": "terminal" if launcher.hands_over_terminal else "web service",
+                "kind": _kind(launcher),
                 "requires_tool_calling": launcher.requires_tool_calling,
+                "modalities": sorted(getattr(launcher, "modalities", ())) or None,
                 "configures": launcher.target(),
                 "needs": " or ".join(launcher.binaries),
                 "available": executable is not None,
@@ -361,10 +381,16 @@ def _catalog_renderer(rows: list[dict]) -> Table:
             status = "stopped"
         else:
             status = "ready"
+        if row["modalities"]:
+            needs = "any inference model"
+        elif row["requires_tool_calling"]:
+            needs = "tool calling"
+        else:
+            needs = "any chat model"
         table.add_row(
             row["tool"],
             row["kind"],
-            "tool calling" if row["requires_tool_calling"] else "any chat model",
+            needs,
             status,
             row["configures"],
         )
@@ -486,7 +512,7 @@ def _renderer(payload: dict) -> Group:
     table.add_row("model", model)
     table.add_row("endpoint", payload["base_url"])
     table.add_row("tool-call parser", payload["tool_call_parser"] or "—")
-    for key in ("container", "image", "endpoint_in_container"):
+    for key in ("container", "image", "endpoint_in_container", "modality", "python"):
         if payload.get(key):
             table.add_row(key.replace("_", " "), payload[key])
     if payload["config_path"]:

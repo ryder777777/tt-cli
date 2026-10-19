@@ -4,6 +4,8 @@
 import json
 import os
 import socket
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
@@ -20,9 +22,16 @@ from tenstorrent.launchers.base import (
     write_json_config,
 )
 from tenstorrent.launchers.container import container_base_url, port_is_free
-from tenstorrent.launchers.discovery import DEFAULT_BASE_URL, base_url_for, probe
+from tenstorrent.launchers.discovery import (
+    DEFAULT_BASE_URL,
+    base_url_for,
+    detect_modality,
+    probe,
+)
+from tenstorrent.launchers.apps.gradio import APP, MODALITIES, interpreter
 from tenstorrent.launchers.apps.openwebui import IMAGE
 from tenstorrent.modelhub.catalog import ModelCatalog
+from tenstorrent.models.model import ModelInfo
 from tenstorrent.output import OutputManager
 from tenstorrent.tools.runner import CaptureResult
 
@@ -621,3 +630,167 @@ def test_hermes_web_moves_to_the_next_free_port_unless_pinned(monkeypatch):
     pinned = plan(LaunchOptions(web=True, web_port=3000, web_port_pinned=True))
     assert pinned.url == "http://localhost:3000"
 
+
+
+# -- gradio -----------------------------------------------------------------------
+@pytest.fixture
+def openapi():
+    """A loopback server publishing `paths` at /openapi.json; None answers 404."""
+    servers: list[ThreadingHTTPServer] = []
+
+    def start(paths: list[str] | None) -> str:
+        body = json.dumps({"paths": {path: {} for path in paths or ()}}).encode()
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler's name
+                if paths is None or self.path != "/openapi.json":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        servers.append(server)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return f"http://127.0.0.1:{server.server_port}/v1"
+
+    yield start
+    for server in servers:
+        server.shutdown()
+        server.server_close()
+
+
+class GradioVersion:
+    """A runner whose Python reports `stdout` as its Gradio version."""
+
+    def __init__(self, stdout: str, returncode: int = 0):
+        self.result = CaptureResult(returncode=returncode, stdout=stdout, stderr="")
+
+    def capture(self, argv, **kwargs):
+        return self.result
+
+
+def _whisper() -> RunningModel:
+    entry = ModelInfo(name="whisper-large-v3", hf_repo="openai/whisper-large-v3", model_type="audio")
+    return RunningModel(
+        served_id="openai/whisper-large-v3", base_url="http://127.0.0.1:8000/v1", entry=entry
+    )
+
+
+@pytest.mark.parametrize(
+    ("paths", "expected"),
+    [
+        # vLLM lists audio and embedding routes beside chat; chat must win.
+        (["/v1/chat/completions", "/v1/embeddings", "/v1/audio/transcriptions"], "llm"),
+        (["/v1/audio/translations"], "audio"),
+        (["/v1/audio/speech"], "text_to_speech"),
+        (["/v1/embeddings"], "embedding"),
+        (["/v1/videos/generations"], "video"),
+        (["/health"], None),
+        (None, None),
+    ],
+)
+def test_detect_modality_reads_the_published_routes(openapi, paths, expected):
+    assert detect_modality(openapi(paths)) == expected
+
+
+def test_gradio_interpreter_follows_the_console_script_shebang(tmp_path, monkeypatch):
+    python = tmp_path / "python3.12"
+    python.write_text("")
+    python.chmod(0o755)
+    script = tmp_path / "gradio"
+    script.write_text(f"#!{python}\n")
+    assert interpreter(str(script)) == str(python)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    script.write_text("#!/usr/bin/env python3.12\n")
+    assert interpreter(str(script)) == str(python)
+    # Pointed straight at a Python, there is nothing to follow.
+    assert interpreter("/opt/venv/bin/python") == "/opt/venv/bin/python"
+
+
+@pytest.mark.parametrize("shebang", ["#!/bin/sh", "#!/nowhere/bin/python3", ""])
+def test_gradio_interpreter_refuses_a_script_it_cannot_trace(tmp_path, shebang):
+    script = tmp_path / "gradio"
+    script.write_text(f"{shebang}\n")
+    with pytest.raises(TTError) as err:
+        interpreter(str(script))
+    assert err.value.exit_code == ExitCode.TOOL_MISSING
+    assert "TT_TOOL_BIN_GRADIO" in err.value.next_step
+
+
+def test_gradio_plan_runs_the_bundled_app_for_the_catalog_modality(monkeypatch):
+    monkeypatch.setattr("tenstorrent.backends.serving.boot.port_is_free", lambda port: True)
+    monkeypatch.setattr(
+        "tenstorrent.launchers.apps.gradio.detect_modality",
+        lambda base_url: pytest.fail("a catalog model needs no probe"),
+    )
+    prep = LAUNCHERS["gradio"].plan(
+        _whisper(), LaunchOptions(), executable="/venv/bin/python", runner=GradioVersion("6.0.2\n")
+    )
+    assert APP.is_file()
+    assert prep.steps == [["/venv/bin/python", str(APP)]]
+    assert prep.url == "http://127.0.0.1:7860"
+    assert prep.env == {
+        "TT_GRADIO_BASE_URL": "http://127.0.0.1:8000/v1",
+        "TT_GRADIO_MODEL": "openai/whisper-large-v3",
+        "TT_GRADIO_MODALITY": "audio",
+        "GRADIO_SERVER_NAME": "127.0.0.1",
+        "GRADIO_SERVER_PORT": "7860",
+        "GRADIO_ANALYTICS_ENABLED": "False",
+    }
+    assert prep.rows == {"modality": "audio", "python": "/venv/bin/python"}
+    assert prep.config is None and prep.consent is None
+
+
+def test_gradio_plan_probes_an_unknown_model_and_assumes_chat_when_it_cannot_tell(monkeypatch):
+    model = RunningModel(served_id="acme/bundle", base_url="http://127.0.0.1:8000/v1")
+    plan = lambda: LAUNCHERS["gradio"].plan(  # noqa: E731
+        model, LaunchOptions(), executable=None, runner=None
+    )
+    monkeypatch.setattr("tenstorrent.launchers.apps.gradio.detect_modality", lambda url: "embedding")
+    assert plan().env["TT_GRADIO_MODALITY"] == "embedding"
+    monkeypatch.setattr("tenstorrent.launchers.apps.gradio.detect_modality", lambda url: None)
+    prep = plan()
+    assert prep.env["TT_GRADIO_MODALITY"] == "llm"
+    assert prep.rows["modality"] == "llm (not detected, assumed)"
+
+
+def test_gradio_plan_keeps_a_pinned_web_port(monkeypatch):
+    monkeypatch.setattr("tenstorrent.backends.serving.boot.port_is_free", lambda port: False)
+    options = LaunchOptions(web_port=9000, web_port_pinned=True)
+    prep = LAUNCHERS["gradio"].plan(_whisper(), options, executable=None, runner=None)
+    assert prep.url == "http://127.0.0.1:9000"
+    assert prep.env["GRADIO_SERVER_PORT"] == "9000"
+
+
+@pytest.mark.parametrize(("stdout", "returncode"), [("5.49.1\n", 0), ("", 1)])
+def test_gradio_plan_refuses_a_missing_or_old_gradio(stdout, returncode):
+    with pytest.raises(TTError) as err:
+        LAUNCHERS["gradio"].plan(
+            _whisper(),
+            LaunchOptions(),
+            executable="/venv/bin/python",
+            runner=GradioVersion(stdout, returncode),
+        )
+    assert err.value.exit_code == ExitCode.TOOL_MISSING
+    assert "Gradio 6 or later" in err.value.why
+
+
+def test_gradio_gates_on_model_type_not_chat():
+    from tenstorrent.commands.launch import _check_capability
+
+    gradio = LAUNCHERS["gradio"]
+    for model_type in MODALITIES:
+        entry = ModelInfo(name="m", hf_repo="org/m", model_type=model_type)
+        _check_capability(None, gradio, RunningModel("org/m", "http://x/v1", entry=entry), force=False)
+    entry = ModelInfo(name="m", hf_repo="org/m", model_type="training")
+    with pytest.raises(TTError) as err:
+        _check_capability(None, gradio, RunningModel("org/m", "http://x/v1", entry=entry), force=True)
+    assert err.value.exit_code == ExitCode.UNSUPPORTED
