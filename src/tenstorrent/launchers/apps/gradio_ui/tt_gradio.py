@@ -123,8 +123,25 @@ def _message(role: str, content) -> dict:
     return {"role": role, "content": parts}
 
 
+# Gradio's Chatbot folds text between these into a collapsible "Reasoning"
+# message, with a spinner until the closing tag arrives.
+THINK = ("<think>", "</think>")
+
+
+def _shown(thinking: str, reply: str, *, done: bool) -> str:
+    """The reply as the Chatbot should render it, reasoning first."""
+    if not thinking:
+        return reply
+    return f"{THINK[0]}{thinking}{THINK[1] if done else ''}{reply}"
+
+
 def chat(model: Model, message, history: list[dict]) -> Iterator[str]:
-    messages = [_message(turn["role"], turn["content"]) for turn in history]
+    # The model's own reasoning is shown, not sent back to it.
+    messages = [
+        _message(turn["role"], turn["content"])
+        for turn in history
+        if not (turn.get("metadata") or {}).get("title")
+    ]
     messages.append(_message("user", message))
     body = {"model": model.id, "messages": messages, "stream": True}
     try:
@@ -135,13 +152,18 @@ def chat(model: Model, message, history: list[dict]) -> Iterator[str]:
             if response.is_error:
                 response.read()
                 _check("/chat/completions", response)
-            reply = ""
+            thinking = reply = ""
             for line in response.iter_lines():
                 if not line.startswith("data: ") or line == "data: [DONE]":
                     continue
                 choices = json.loads(line[len("data: "):]).get("choices") or [{}]
-                reply += (choices[0].get("delta") or {}).get("content") or ""
-                yield reply
+                delta = choices[0].get("delta") or {}
+                # vLLM with a reasoning parser streams the thinking apart from
+                # the answer: `reasoning`, or `reasoning_content` before v0.10.
+                thinking += delta.get("reasoning") or delta.get("reasoning_content") or ""
+                reply += delta.get("content") or ""
+                yield _shown(thinking, reply, done=bool(reply.strip()))
+            yield _shown(thinking, reply, done=True)
     except httpx.HTTPError as exc:
         raise gr.Error(f"Could not reach {model.base_url}: {exc}") from exc
 
@@ -162,7 +184,11 @@ def build_chat(models: list[Model], which: gr.components.Component, multimodal: 
         additional_inputs=[which],
         # None leaves the picker alone: an example runs on the model chosen now.
         examples=None if multimodal else [[text, None] for text in examples],
-        chatbot=gr.Chatbot(height=520, show_label=False, elem_classes="tt-chatbot"),
+        # Also catches models served without a reasoning parser, which leave
+        # their <think> block inline in the answer.
+        chatbot=gr.Chatbot(
+            height=520, show_label=False, reasoning_tags=[THINK], elem_classes="tt-chatbot"
+        ),
     )
 
 
@@ -636,10 +662,16 @@ gradio-app, .gradio-container, .gradio-container .main { background: transparent
 .tt-nav-app::before { content: ""; width: 9px; height: 9px; background: #ffc757; }
 .tt-nav-end { display: flex; align-items: center; gap: 20px; margin-left: auto; padding: 0 12px 0 20px; }
 .tt-nav-status { display: flex; align-items: center; gap: 10px; white-space: nowrap; }
-.tt-theme { display: flex; border: 1px solid #344d49; border-radius: 6px; padding: 3px; gap: 2px; }
+/* Sized exactly (1px border + 3px padding around 26px buttons) so the chosen
+   button sits centred; Gradio's button styles would otherwise stretch them. */
+.tt-theme {
+  display: flex; align-items: center; gap: 2px; box-sizing: border-box; height: 34px; padding: 3px;
+  border: 1px solid #344d49; border-radius: 6px;
+}
 .tt-theme button {
-  display: grid; place-items: center; width: 32px; height: 26px; border-radius: 4px;
-  border: none; background: none; cursor: pointer;
+  display: grid; place-items: center; flex: none; box-sizing: border-box;
+  width: 32px; height: 26px; min-height: 0; margin: 0; padding: 0;
+  border: none; border-radius: 4px; background: none; cursor: pointer; line-height: 0;
 }
 .tt-nav .tt-theme button { color: #7a9994 !important; }
 .tt-nav .tt-theme button:not([aria-pressed="true"]):hover { color: #e7f0ee !important; }
