@@ -965,8 +965,34 @@ def test_gradio_json_reports_the_modality_without_starting(runner, served, fake_
     )
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
-    assert payload["modality"] == "audio"
-    assert payload["env"]["TT_GRADIO_MODALITY"] == "audio"
+    assert [m["modality"] for m in payload["models"]] == ["audio"]
+    assert json.loads(payload["env"]["TT_GRADIO_MODELS"])[0]["modality"] == "audio"
+    assert execed == []
+
+
+@pytest.mark.fakes_only
+def test_gradio_shows_every_served_model_unless_told_which(runner, served, fake_gradio, execed):
+    fake_gradio()
+    base = served("openai/whisper-large-v3", "Qwen/Qwen3-32B")
+
+    def shown(*args: str) -> list[tuple[str, str]]:
+        result = runner.invoke(app, ["launch", "gradio", "--url", base, "--json", *args])
+        assert result.exit_code == 0, result.output
+        models = json.loads(json.loads(result.stdout)["env"]["TT_GRADIO_MODELS"])
+        return [(m["id"], m["modality"]) for m in models]
+
+    assert shown() == [("openai/whisper-large-v3", "audio"), ("Qwen/Qwen3-32B", "llm")]
+    assert shown("--model", "Qwen3-32B") == [("Qwen/Qwen3-32B", "llm")]
+    assert len(shown("--model", "Qwen3-32B", "--model", "openai/whisper-large-v3")) == 2
+
+
+@pytest.mark.fakes_only
+def test_a_single_model_client_refuses_several_models(runner, served, fake_client, execed):
+    base = served("Qwen/Qwen3-32B", "openai/whisper-large-v3")
+    picks = ["--model", "Qwen3-32B", "--model", "whisper-large-v3"]
+    result = runner.invoke(app, ["launch", "opencode", "--url", base, *picks])
+    assert result.exit_code == ExitCode.USAGE
+    assert "connects to one model" in result.output
     assert execed == []
 
 

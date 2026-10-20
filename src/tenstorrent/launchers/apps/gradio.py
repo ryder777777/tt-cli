@@ -5,16 +5,19 @@
 
 tt ships the app (apps/gradio_ui/tt_gradio.py) but never Gradio itself: the
 user installs it anywhere, and tt runs the app with the Python behind `gradio`.
-The app builds its UI from the served model's modality, so one client covers
-chat, embeddings, speech, images, video and image classification. Configured by
+One app covers every model being served, with a tab per task: chat,
+embeddings, speech, images, video and image classification. Configured by
 environment, so nothing persists past the run.
 """
 
 from __future__ import annotations
 
+import json
 import shutil
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from ...errors import ExitCode, TTError
 from ..base import LaunchEnv, LaunchOptions, Preparation, RunningModel, free_web_port
@@ -57,6 +60,20 @@ def interpreter(executable: str) -> str:
     )
 
 
+def _labels(models: list[RunningModel]) -> list[str]:
+    """Short names for the UI: the catalog name, else the id's last path segment
+    (a server may report a local path such as /weight-cache/hf_view/s2-pro). Two
+    servers of one model are told apart by port."""
+    names = [
+        m.entry.name if m.entry else m.served_id.rstrip("/").rsplit("/", 1)[-1] for m in models
+    ]
+    counts = Counter(names)
+    return [
+        f"{name} :{urlsplit(m.base_url).port}" if counts[name] > 1 else name
+        for name, m in zip(names, models, strict=True)
+    ]
+
+
 class Gradio:
     id = "gradio"
     binaries = ("gradio",)
@@ -70,6 +87,7 @@ class Gradio:
     hands_over_terminal = True  # Gradio serves in the foreground; Ctrl+C stops it
     kind = "web UI"
     modalities = MODALITIES
+    multi_model = True  # one UI for every served model it handles, a tab per task
 
     def target(self) -> str:
         return "environment (this run only)"
@@ -82,25 +100,58 @@ class Gradio:
         executable: str | None,
         runner,
     ) -> Preparation:
+        return self.plan_all([model], options, executable=executable, runner=runner)
+
+    def plan_all(
+        self,
+        models: list[RunningModel],
+        options: LaunchOptions,
+        *,
+        executable: str | None,
+        runner,
+    ) -> Preparation:
         python = interpreter(executable) if executable else "python3"
         if executable:
             self._check_version(python, runner)
-        detected = model.entry.model_type if model.entry else detect_modality(model.base_url)
-        modality = detected or "llm"
+        probed: dict[str, str | None] = {}  # one /openapi.json read per server
+        served = []
+        for model, label in zip(models, _labels(models), strict=True):
+            detected = model.entry.model_type if model.entry else None
+            if detected is None:
+                if model.base_url not in probed:
+                    probed[model.base_url] = detect_modality(model.base_url)
+                detected = probed[model.base_url]
+            served.append(
+                {
+                    "id": model.served_id,
+                    "label": label,
+                    "base_url": model.base_url,
+                    "modality": detected or "llm",
+                    "detected": detected is not None,
+                }
+            )
         if not options.web_port_pinned:
             options = replace(options, web_port=DEFAULT_PORT)
         web_port = free_web_port(options)
+        app_models = [{k: m[k] for k in ("id", "label", "base_url", "modality")} for m in served]
         env = {
-            "TT_GRADIO_BASE_URL": model.base_url,
-            "TT_GRADIO_MODEL": model.served_id,
-            "TT_GRADIO_MODALITY": modality,
+            "TT_GRADIO_MODELS": json.dumps(app_models, separators=(",", ":")),
             "GRADIO_SERVER_NAME": "127.0.0.1",
             "GRADIO_SERVER_PORT": str(web_port),
             "GRADIO_ANALYTICS_ENABLED": "False",
         }
         return Preparation(
             rows={
-                "modality": modality if detected else f"{modality} (not detected, assumed)",
+                "models": [
+                    {
+                        "model": m["id"],
+                        "base_url": m["base_url"],
+                        "modality": m["modality"]
+                        if m["detected"]
+                        else f"{m['modality']} (not detected, assumed)",
+                    }
+                    for m in served
+                ],
                 "python": python,
             },
             env=env,

@@ -127,7 +127,7 @@ tt launch stop openwebui               # stop it, keeping its data
 tt launch hermes                       # Hermes Agent's terminal UI on the served model
 tt launch hermes --web                 # its web dashboard and chat, on the same model
 tt launch stop hermes                  # stop that dashboard (any running Hermes dashboard)
-tt launch gradio                       # a browser UI that matches the model: chat, Whisper, TTS, images, …
+tt launch gradio                       # one browser UI for every served model: chat, Whisper, TTS, images, …
 ```
 
 ## Serving backends

@@ -737,15 +737,25 @@ def test_gradio_plan_runs_the_bundled_app_for_the_catalog_modality(monkeypatch):
     assert APP.is_file()
     assert prep.steps == [["/venv/bin/python", str(APP)]]
     assert prep.url == "http://127.0.0.1:7860"
+    assert json.loads(prep.env.pop("TT_GRADIO_MODELS")) == [
+        {
+            "id": "openai/whisper-large-v3",
+            "label": "whisper-large-v3",
+            "base_url": "http://127.0.0.1:8000/v1",
+            "modality": "audio",
+        }
+    ]
     assert prep.env == {
-        "TT_GRADIO_BASE_URL": "http://127.0.0.1:8000/v1",
-        "TT_GRADIO_MODEL": "openai/whisper-large-v3",
-        "TT_GRADIO_MODALITY": "audio",
         "GRADIO_SERVER_NAME": "127.0.0.1",
         "GRADIO_SERVER_PORT": "7860",
         "GRADIO_ANALYTICS_ENABLED": "False",
     }
-    assert prep.rows == {"modality": "audio", "python": "/venv/bin/python"}
+    assert prep.rows == {
+        "models": [
+            {"model": "openai/whisper-large-v3", "base_url": "http://127.0.0.1:8000/v1", "modality": "audio"}
+        ],
+        "python": "/venv/bin/python",
+    }
     assert prep.config is None and prep.consent is None
 
 
@@ -754,12 +764,36 @@ def test_gradio_plan_probes_an_unknown_model_and_assumes_chat_when_it_cannot_tel
     plan = lambda: LAUNCHERS["gradio"].plan(  # noqa: E731
         model, LaunchOptions(), executable=None, runner=None
     )
+    modality = lambda prep: json.loads(prep.env["TT_GRADIO_MODELS"])[0]["modality"]  # noqa: E731
     monkeypatch.setattr("tenstorrent.launchers.apps.gradio.detect_modality", lambda url: "embedding")
-    assert plan().env["TT_GRADIO_MODALITY"] == "embedding"
+    assert modality(plan()) == "embedding"
     monkeypatch.setattr("tenstorrent.launchers.apps.gradio.detect_modality", lambda url: None)
     prep = plan()
-    assert prep.env["TT_GRADIO_MODALITY"] == "llm"
-    assert prep.rows["modality"] == "llm (not detected, assumed)"
+    assert modality(prep) == "llm"
+    assert prep.rows["models"][0]["modality"] == "llm (not detected, assumed)"
+
+
+def test_gradio_plan_all_labels_each_model_and_probes_each_server_once(monkeypatch):
+    probed: list[str] = []
+
+    def detect(url: str) -> str:
+        probed.append(url)
+        return "text_to_speech"
+
+    monkeypatch.setattr("tenstorrent.launchers.apps.gradio.detect_modality", detect)
+    models = [
+        _whisper(),
+        RunningModel("/weight-cache/hf_view/s2-pro", "http://127.0.0.1:20002/v1"),
+        RunningModel("acme/voice", "http://127.0.0.1:20003/v1"),
+        RunningModel("other/voice", "http://127.0.0.1:20003/v1"),
+    ]
+    prep = LAUNCHERS["gradio"].plan_all(models, LaunchOptions(), executable=None, runner=None)
+    served = json.loads(prep.env["TT_GRADIO_MODELS"])
+    # A path-like id shows as its last segment; a clash is told apart by port.
+    assert [m["label"] for m in served] == ["whisper-large-v3", "s2-pro", "voice :20003", "voice :20003"]
+    assert [m["modality"] for m in served] == ["audio"] + ["text_to_speech"] * 3
+    # The catalog model needs no probe, and two models on one server share one.
+    assert probed == ["http://127.0.0.1:20002/v1", "http://127.0.0.1:20003/v1"]
 
 
 def test_gradio_plan_keeps_a_pinned_web_port(monkeypatch):
@@ -781,6 +815,28 @@ def test_gradio_plan_refuses_a_missing_or_old_gradio(stdout, returncode):
         )
     assert err.value.exit_code == ExitCode.TOOL_MISSING
     assert "Gradio 6 or later" in err.value.why
+
+
+def test_gradio_skips_models_it_has_no_ui_for_unless_none_are_left():
+    from tenstorrent.commands.launch import _usable
+
+    class Output:
+        def __init__(self):
+            self.warnings: list[str] = []
+
+        def warn(self, message):
+            self.warnings.append(message)
+
+    appctx = type("AppCtx", (), {"output": Output()})()
+    gradio = LAUNCHERS["gradio"]
+    trainer = ModelInfo(name="t", hf_repo="org/t", model_type="training")
+    unusable = RunningModel("org/t", "http://x/v1", entry=trainer)
+    assert _usable(appctx, gradio, [_whisper(), unusable], force=False) == [_whisper()]
+    handles = ", ".join(sorted(MODALITIES))
+    assert appctx.output.warnings == [f"skipping org/t: t is a training model; gradio handles {handles}."]
+    with pytest.raises(TTError) as err:
+        _usable(appctx, gradio, [unusable], force=False)
+    assert err.value.exit_code == ExitCode.UNSUPPORTED
 
 
 def test_gradio_gates_on_model_type_not_chat():

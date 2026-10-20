@@ -38,7 +38,7 @@ tt never installs these. Install the agent yourself, then `tt launch` writes the
 
 ## Gradio: you install Gradio, tt brings the UI
 
-`tt launch gradio` opens a browser UI for **any** model tt serves, not just chat models. tt ships the app; you only install [Gradio](https://www.gradio.app/) 6 or later. The UI follows the model's type:
+`tt launch gradio` opens one browser UI for **every** model tt is serving, not just chat models. tt ships the app; you only install [Gradio](https://www.gradio.app/) 6 or later. Each model's type gets a tab:
 
 | Model type | What you get |
 |---|---|
@@ -55,7 +55,9 @@ uv tool install gradio   # or: pipx install gradio, or pip install gradio in a v
 tt launch gradio         # opens http://127.0.0.1:7860; Ctrl+C stops it
 ```
 
-- tt takes the model's type from its catalog. For a model outside the catalog it reads the server's routes (`/openapi.json`), and falls back to chat if it can't tell.
+- Serving several models at once (say Whisper, two TTS voices and an LLM, each in its own container)? They all show up: a card per model with a live status dot, a tab per task, and a picker in the tab when two models do the same job. Every result shows how long the model took.
+- `--model` narrows it to the ones you name; repeat it to pick several (`tt launch gradio --model whisper-large-v3 --model speecht5_tts`).
+- tt takes each model's type from its catalog. For a model outside the catalog it reads the server's routes (`/openapi.json`), and falls back to chat if it can't tell.
 - Any Gradio install works (global, a venv, conda, pipx, uv): tt finds `gradio` on PATH and runs the app with the Python behind it. For a venv that isn't activated, point tt at it: `TT_TOOL_BIN_GRADIO=/path/to/venv/bin/python`.
 - Nothing is written to disk. The UI listens on 127.0.0.1 only, and Gradio's usage analytics are turned off.
 
@@ -76,7 +78,7 @@ tt launch list                       # every client, and whether it's usable now
 tt launch <client>                   # connect it to the model you're serving
 tt launch <client> --dry-run         # show what would be done, change nothing
 tt launch stop openwebui             # stop a web UI (or the Hermes dashboard); its data is kept
-tt launch gradio                     # a UI for whatever model is served; Ctrl+C stops it
+tt launch gradio                     # one UI for every served model; Ctrl+C stops it
 tt launch disconnect opencode        # undo the config tt wrote for a client
 ```
 

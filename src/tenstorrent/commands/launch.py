@@ -19,6 +19,7 @@ import dataclasses
 import json
 import shlex
 import sys
+from typing import Annotated
 
 import typer
 from rich.console import Group
@@ -125,21 +126,17 @@ def _discover_local(appctx) -> list[RunningModel]:
     return served
 
 
-def _select(appctx, served: list[RunningModel], wanted: str | None) -> RunningModel:
-    """The model to connect to, with its catalog entry attached when tt knows it."""
+def _resolve(served: list[RunningModel]) -> list[RunningModel]:
+    """`served`, with each catalog entry attached when tt knows the model."""
     catalog = ModelCatalog()
     # cached_sizes={} skips the HF cache scan: matching only needs names.
-    resolved = [
+    return [
         dataclasses.replace(s, entry=catalog.find(s.served_id, cached_sizes={}))
         for s in served
     ]
-    if wanted is None:
-        if len(resolved) > 1:
-            appctx.output.warn(
-                f"the server is serving {len(resolved)} models; using "
-                f"{resolved[0].served_id} (choose with --model)."
-            )
-        return resolved[0]
+
+
+def _match(resolved: list[RunningModel], wanted: str) -> RunningModel:
     target = wanted.lower()
     for candidate in resolved:
         names = {candidate.served_id.lower()}
@@ -153,6 +150,50 @@ def _select(appctx, served: list[RunningModel], wanted: str | None) -> RunningMo
         next_step=f"Serve it first (`tt serve {wanted}`), or drop --model.",
         exit_code=ExitCode.USAGE,
     )
+
+
+def _select(appctx, served: list[RunningModel], wanted: str | None) -> RunningModel:
+    """The model to connect to, with its catalog entry attached when tt knows it."""
+    resolved = _resolve(served)
+    if wanted is None:
+        if len(resolved) > 1:
+            appctx.output.warn(
+                f"the server is serving {len(resolved)} models; using "
+                f"{resolved[0].served_id} (choose with --model)."
+            )
+        return resolved[0]
+    return _match(resolved, wanted)
+
+
+def _select_all(served: list[RunningModel], wanted: list[str]) -> list[RunningModel]:
+    """Every served model, or just the ones --model names, for a client that
+    shows several at once."""
+    resolved = _resolve(served)
+    if not wanted:
+        return resolved
+    chosen = [_match(resolved, name) for name in wanted]
+    return list({(m.base_url, m.served_id): m for m in chosen}.values())
+
+
+def _usable(
+    appctx, launcher: Launcher, models: list[RunningModel], *, force: bool
+) -> list[RunningModel]:
+    """The models the client can work with. The others are skipped with a warning,
+    unless none are left, when the reason the last one was refused is the error."""
+    usable: list[RunningModel] = []
+    refused: list[tuple[RunningModel, TTError]] = []
+    for model in models:
+        try:
+            _check_capability(appctx, launcher, model, force=force)
+        except TTError as exc:
+            refused.append((model, exc))
+        else:
+            usable.append(model)
+    if not usable:
+        raise refused[-1][1]
+    for model, exc in refused:
+        appctx.output.warn(f"skipping {model.served_id}: {exc.why}")
+    return usable
 
 
 def _check_capability(appctx, launcher: Launcher, model: RunningModel, *, force: bool) -> None:
@@ -230,11 +271,15 @@ def _ask(appctx, question: str, *, yes: bool) -> None:
 # -- connect (one command per client) ---------------------------------------------
 def _connect(
     ctx: typer.Context,
-    model: str = typer.Option(
-        None,
-        "--model",
-        help="Which served model to connect to, when more than one is running.",
-    ),
+    model: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--model",
+            help="Which served model to connect to, when more than one is running. "
+            "Clients that show several at once (gradio) take every model by default; "
+            "repeat --model to pick some.",
+        ),
+    ] = None,
     port: int = typer.Option(
         None, "--port", min=1, max=65535, help="Port the model is served on."
     ),
@@ -282,12 +327,24 @@ def _connect(
             next_step="Drop --web to use its terminal UI.",
             exit_code=ExitCode.USAGE,
         )
+    multi = getattr(launcher, "multi_model", False)
+    if model and len(model) > 1 and not multi:
+        raise TTError(
+            f"{launcher.id} connects to one model.",
+            why=f"--model was given {len(model)} times.",
+            next_step="Pass --model once.",
+            exit_code=ExitCode.USAGE,
+        )
     if url is None and port is None:
         served = _discover_local(appctx)
     else:
         served = discover(base_url_for(url, port))
-    target = _select(appctx, served, model)
-    _check_capability(appctx, launcher, target, force=force)
+    if multi:
+        targets = _usable(appctx, launcher, _select_all(served, model or []), force=force)
+        target = targets[0]
+    else:
+        target = _select(appctx, served, model[0] if model else None)
+        _check_capability(appctx, launcher, target, force=force)
     # A dry run must not require the client to be installed. It still resolves one
     # when it can, so what it reports (an existing container, say) is the truth on
     # this machine rather than a guess.
@@ -301,7 +358,10 @@ def _connect(
         web_port_pinned=web_port is not None,
         web=web,
     )
-    prep = launcher.plan(target, options, executable=executable, runner=appctx.runner)
+    if multi:
+        prep = launcher.plan_all(targets, options, executable=executable, runner=appctx.runner)
+    else:
+        prep = launcher.plan(target, options, executable=executable, runner=appctx.runner)
     # A terminal client is still configured under --no-exec — that is what the flag
     # is for. For a service, starting it is the only action, so it waits for start.
     start = not dry_run and not no_exec and not (json_mode and launcher.hands_over_terminal)
@@ -506,13 +566,19 @@ def _renderer(payload: dict) -> Group:
     table = Table(title=f"tt launch {payload['tool']} — {verb}", show_header=False)
     table.add_column("field", style="bold")
     table.add_column("value", overflow="fold")
-    model = payload["model"]
-    if payload["catalog_name"] and payload["catalog_name"] != model:
-        model += f"  [dim]({payload['catalog_name']})[/dim]"
-    table.add_row("model", model)
-    table.add_row("endpoint", payload["base_url"])
-    table.add_row("tool-call parser", payload["tool_call_parser"] or "—")
-    for key in ("container", "image", "endpoint_in_container", "modality", "python"):
+    if payload.get("models"):  # a client showing several models at once
+        for row in payload["models"]:
+            table.add_row(
+                "model", f"{row['model']}  [dim]({row['modality']} · {row['base_url']})[/dim]"
+            )
+    else:
+        model = payload["model"]
+        if payload["catalog_name"] and payload["catalog_name"] != model:
+            model += f"  [dim]({payload['catalog_name']})[/dim]"
+        table.add_row("model", model)
+        table.add_row("endpoint", payload["base_url"])
+        table.add_row("tool-call parser", payload["tool_call_parser"] or "—")
+    for key in ("container", "image", "endpoint_in_container", "python"):
         if payload.get(key):
             table.add_row(key.replace("_", " "), payload[key])
     if payload["config_path"]:
@@ -522,6 +588,8 @@ def _renderer(payload: dict) -> Group:
     if payload["url"]:
         table.add_row("open", payload["url"])
     for key, value in (payload.get("env") or {}).items():
+        if len(value) > 120:  # a JSON blob (the gradio model list): --json has it whole
+            value = f"[dim]{len(value)} characters; see --json[/dim]"
         table.add_row(key, value)
     body = [table]
     if not payload["applied"]:
